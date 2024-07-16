@@ -746,6 +746,16 @@
     "excluded-python-versions": [],
     "state": "ready"
   },
+  "milvus": {
+    "deps": [
+      "apache-airflow>=2.7.0",
+      "pymilvus@git+https://github.com/dald001/pymilvus#egg=2.4"
+    ],
+    "devel-deps": [],
+    "cross-providers-deps": [],
+    "excluded-python-versions": [],
+    "state": "ready"
+  },
   "mongo": {
     "deps": [
       "apache-airflow>=2.6.0",
