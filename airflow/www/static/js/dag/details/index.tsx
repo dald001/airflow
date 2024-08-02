@@ -17,7 +17,7 @@
  * under the License.
  */
 
-import React, { useCallback, useEffect } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   Flex,
   Divider,
@@ -28,7 +28,9 @@ import {
   Tab,
   Text,
   Button,
+  Checkbox,
 } from "@chakra-ui/react";
+import InfoTooltip from "src/components/InfoTooltip";
 import { useSearchParams } from "react-router-dom";
 
 import useSelection from "src/dag/useSelection";
@@ -42,10 +44,10 @@ import {
   MdOutlineViewTimeline,
   MdSyncAlt,
   MdHourglassBottom,
-  MdPlagiarism,
   MdEvent,
+  MdOutlineEventNote,
 } from "react-icons/md";
-import { BiBracket } from "react-icons/bi";
+import { BiBracket, BiLogoKubernetes } from "react-icons/bi";
 import URLSearchParamsWrapper from "src/utils/URLSearchParamWrapper";
 
 import Header from "./Header";
@@ -64,10 +66,12 @@ import MarkRunAs from "./dagRun/MarkRunAs";
 import ClearInstance from "./taskInstance/taskActions/ClearInstance";
 import MarkInstanceAs from "./taskInstance/taskActions/MarkInstanceAs";
 import XcomCollection from "./taskInstance/Xcom";
+import AllTaskDuration from "./task/AllTaskDuration";
 import TaskDetails from "./task";
-import AuditLog from "./AuditLog";
+import EventLog from "./EventLog";
 import RunDuration from "./dag/RunDuration";
 import Calendar from "./dag/Calendar";
+import RenderedK8s from "./taskInstance/RenderedK8s";
 
 const dagId = getMetaValue("dag_id")!;
 
@@ -77,9 +81,9 @@ interface Props {
   hoveredTaskState?: string | null;
   gridScrollRef: React.RefObject<HTMLDivElement>;
   ganttScrollRef: React.RefObject<HTMLDivElement>;
-  isFullScreen?: boolean;
-  toggleFullScreen?: () => void;
 }
+
+const isK8sExecutor = getMetaValue("k8s_or_k8scelery_executor") === "True";
 
 const tabToIndex = (tab?: string) => {
   switch (tab) {
@@ -89,6 +93,7 @@ const tabToIndex = (tab?: string) => {
       return 2;
     case "code":
       return 3;
+    case "event_log":
     case "audit_log":
       return 4;
     case "logs":
@@ -96,8 +101,11 @@ const tabToIndex = (tab?: string) => {
     case "run_duration":
       return 5;
     case "xcom":
-    case "calendar":
+    case "task_duration":
       return 6;
+    case "calendar":
+    case "rendered_k8s":
+      return 7;
     case "details":
     default:
       return 0;
@@ -127,15 +135,19 @@ const indexToTab = (
     case 3:
       return "code";
     case 4:
-      return "audit_log";
+      return "event_log";
     case 5:
       if (isMappedTaskSummary) return "mapped_tasks";
       if (isTaskInstance) return "logs";
       if (!runId && !taskId) return "run_duration";
       return undefined;
     case 6:
-      if (!runId && !taskId) return "calendar";
+      if (!runId && !taskId) return "task_duration";
       if (isTaskInstance) return "xcom";
+      return undefined;
+    case 7:
+      if (!runId && !taskId) return "calendar";
+      if (isTaskInstance && isK8sExecutor) return "rendered_k8s";
       return undefined;
     default:
       return undefined;
@@ -150,8 +162,6 @@ const Details = ({
   hoveredTaskState,
   gridScrollRef,
   ganttScrollRef,
-  isFullScreen,
-  toggleFullScreen,
 }: Props) => {
   const {
     selected: { runId, taskId, mapIndex },
@@ -167,6 +177,7 @@ const Details = ({
   const children = group?.children;
   const isMapped = group?.isMapped;
   const isGroup = !!children;
+  const [showBar, setShowBar] = useState(false);
 
   const isMappedTaskSummary = !!(
     taskId &&
@@ -231,7 +242,9 @@ const Details = ({
     dagRunId: runId || "",
     taskId: taskId || "",
     mapIndex,
-    enabled: mapIndex !== undefined,
+    options: {
+      enabled: mapIndex !== undefined,
+    },
   });
 
   const instance =
@@ -241,12 +254,7 @@ const Details = ({
 
   return (
     <Flex flexDirection="column" height="100%">
-      <Flex
-        alignItems="center"
-        justifyContent="space-between"
-        flexWrap="wrap"
-        ml={6}
-      >
+      <Flex alignItems="center" justifyContent="space-between" flexWrap="wrap">
         <Header
           mapIndex={
             mappedTaskInstance?.renderedMapIndex || mappedTaskInstance?.mapIndex
@@ -287,7 +295,7 @@ const Details = ({
               />
             </>
           )}
-          {taskId && runId && <FilterTasks taskId={taskId} />}
+          <FilterTasks taskId={taskId} />
         </Flex>
       </Flex>
       <Divider my={2} />
@@ -324,9 +332,9 @@ const Details = ({
             </Text>
           </Tab>
           <Tab>
-            <MdPlagiarism size={16} />
+            <MdOutlineEventNote size={16} />
             <Text as="strong" ml={1}>
-              Audit Log
+              Event Log
             </Text>
           </Tab>
           {isDag && (
@@ -334,6 +342,14 @@ const Details = ({
               <MdHourglassBottom size={16} />
               <Text as="strong" ml={1}>
                 Run Duration
+              </Text>
+            </Tab>
+          )}
+          {isDag && (
+            <Tab>
+              <MdHourglassBottom size={16} />
+              <Text as="strong" ml={1}>
+                Task Duration
               </Text>
             </Tab>
           )}
@@ -366,6 +382,14 @@ const Details = ({
               <MdSyncAlt size={16} />
               <Text as="strong" ml={1}>
                 XCom
+              </Text>
+            </Tab>
+          )}
+          {isTaskInstance && isK8sExecutor && (
+            <Tab>
+              <BiLogoKubernetes size={16} />
+              <Text as="strong" ml={1}>
+                K8s Pod Spec
               </Text>
             </Tab>
           )}
@@ -418,8 +442,6 @@ const Details = ({
               openGroupIds={openGroupIds}
               onToggleGroups={onToggleGroups}
               hoveredTaskState={hoveredTaskState}
-              isFullScreen={isFullScreen}
-              toggleFullScreen={toggleFullScreen}
             />
           </TabPanel>
           <TabPanel p={0} height="100%">
@@ -433,8 +455,9 @@ const Details = ({
             <DagCode />
           </TabPanel>
           <TabPanel height="100%">
-            <AuditLog
+            <EventLog
               taskId={isGroup || !taskId ? undefined : taskId}
+              showMapped={isMapped || !taskId}
               run={run}
             />
           </TabPanel>
@@ -444,7 +467,22 @@ const Details = ({
             </TabPanel>
           )}
           {isDag && (
-            <TabPanel height="100%" width="100%">
+            <TabPanel height="80%">
+              <Flex justifyContent="right" pr="30px">
+                <Checkbox
+                  isChecked={showBar}
+                  onChange={() => setShowBar(!showBar)}
+                  size="lg"
+                >
+                  Show Bar Chart
+                </Checkbox>
+                <InfoTooltip label="Show bar chart" size={16} />
+              </Flex>
+              <AllTaskDuration showBar={showBar} />
+            </TabPanel>
+          )}
+          {isDag && (
+            <TabPanel height="100%" width="100%" overflow="auto">
               <Calendar />
             </TabPanel>
           )}
@@ -469,8 +507,6 @@ const Details = ({
                     ? undefined
                     : instance.state
                 }
-                isFullScreen={isFullScreen}
-                toggleFullScreen={toggleFullScreen}
               />
             </TabPanel>
           )}
@@ -495,6 +531,11 @@ const Details = ({
                 mapIndex={mapIndex}
                 tryNumber={instance?.tryNumber}
               />
+            </TabPanel>
+          )}
+          {isTaskInstance && isK8sExecutor && (
+            <TabPanel height="100%">
+              <RenderedK8s />
             </TabPanel>
           )}
         </TabPanels>

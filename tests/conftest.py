@@ -16,14 +16,12 @@
 # under the License.
 from __future__ import annotations
 
-import functools
 import json
 import os
 import platform
 import re
 import subprocess
 import sys
-import warnings
 from contextlib import ExitStack, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,44 +29,59 @@ from typing import TYPE_CHECKING
 
 import pytest
 import time_machine
-import yaml
 from itsdangerous import URLSafeSerializer
 
 if TYPE_CHECKING:
     from tests._internals.capture_warnings import CaptureWarningsPlugin  # noqa: F401
+    from tests._internals.forbidden_warnings import ForbiddenWarningsPlugin  # noqa: F401
 
 # We should set these before loading _any_ of the rest of airflow so that the
 # unit test mode config is set as early as possible.
 assert "airflow" not in sys.modules, "No airflow module can be imported before these lines"
 
-# Clear all Environment Variables that might have side effect,
-# For example, defined in /files/airflow-breeze-config/variables.env
-_AIRFLOW_CONFIG_PATTERN = re.compile(r"^AIRFLOW__(.+)__(.+)$")
-_KEEP_CONFIGS_SETTINGS: dict[str, dict[str, set[str]]] = {
-    # Keep always these configurations
-    "always": {
-        "database": {"sql_alchemy_conn"},
-        "core": {"sql_alchemy_conn"},
-        "celery": {"result_backend", "broker_url"},
-    },
-    # Keep per enabled integrations
-    "celery": {"celery": {"*"}, "celery_broker_transport_options": {"*"}},
-    "kerberos": {"kerberos": {"*"}},
-}
-_ENABLED_INTEGRATIONS = {e.split("_", 1)[-1].lower() for e in os.environ if e.startswith("INTEGRATION_")}
-_KEEP_CONFIGS: dict[str, set[str]] = {}
-for keep_settings_key in ("always", *_ENABLED_INTEGRATIONS):
-    if keep_settings := _KEEP_CONFIGS_SETTINGS.get(keep_settings_key):
-        for section, options in keep_settings.items():
-            if section not in _KEEP_CONFIGS:
-                _KEEP_CONFIGS[section] = options
-            else:
-                _KEEP_CONFIGS[section].update(options)
-for env_key in os.environ.copy():
-    if m := _AIRFLOW_CONFIG_PATTERN.match(env_key):
-        section, option = m.group(1).lower(), m.group(2).lower()
-        if not (ko := _KEEP_CONFIGS.get(section)) or not ("*" in ko or option in ko):
-            del os.environ[env_key]
+keep_env_variables = "--keep-env-variables" in sys.argv
+
+if not keep_env_variables:
+    # Clear all Environment Variables that might have side effect,
+    # For example, defined in /files/airflow-breeze-config/variables.env
+    _AIRFLOW_CONFIG_PATTERN = re.compile(r"^AIRFLOW__(.+)__(.+)$")
+    _KEEP_CONFIGS_SETTINGS: dict[str, dict[str, set[str]]] = {
+        # Keep always these configurations
+        "always": {
+            "database": {"sql_alchemy_conn"},
+            "core": {"sql_alchemy_conn"},
+            "celery": {"result_backend", "broker_url"},
+        },
+        # Keep per enabled integrations
+        "celery": {"celery": {"*"}, "celery_broker_transport_options": {"*"}},
+        "kerberos": {"kerberos": {"*"}},
+    }
+    if os.environ.get("RUN_TESTS_WITH_DATABASE_ISOLATION", "false").lower() == "true":
+        _KEEP_CONFIGS_SETTINGS["always"].update(
+            {
+                "core": {
+                    "internal_api_url",
+                    "fernet_key",
+                    "database_access_isolation",
+                    "internal_api_secret_key",
+                    "internal_api_clock_grace",
+                },
+            }
+        )
+    _ENABLED_INTEGRATIONS = {e.split("_", 1)[-1].lower() for e in os.environ if e.startswith("INTEGRATION_")}
+    _KEEP_CONFIGS: dict[str, set[str]] = {}
+    for keep_settings_key in ("always", *_ENABLED_INTEGRATIONS):
+        if keep_settings := _KEEP_CONFIGS_SETTINGS.get(keep_settings_key):
+            for section, options in keep_settings.items():
+                if section not in _KEEP_CONFIGS:
+                    _KEEP_CONFIGS[section] = options
+                else:
+                    _KEEP_CONFIGS[section].update(options)
+    for env_key in os.environ.copy():
+        if m := _AIRFLOW_CONFIG_PATTERN.match(env_key):
+            section, option = m.group(1).lower(), m.group(2).lower()
+            if not (ko := _KEEP_CONFIGS.get(section)) or not ("*" in ko or option in ko):
+                del os.environ[env_key]
 
 SUPPORTED_DB_BACKENDS = ("sqlite", "postgres", "mysql")
 
@@ -122,6 +135,7 @@ collect_ignore = [
 
 # https://docs.pytest.org/en/stable/reference/reference.html#stash
 capture_warnings_key = pytest.StashKey["CaptureWarningsPlugin"]()
+forbidden_warnings_key = pytest.StashKey["ForbiddenWarningsPlugin"]()
 
 
 @pytest.fixture
@@ -214,7 +228,21 @@ def trace_sql(request):
         yield
 
 
-def pytest_addoption(parser):
+@pytest.fixture(autouse=True, scope="session")
+def set_db_isolation_mode():
+    if os.environ.get("RUN_TESTS_WITH_DATABASE_ISOLATION", "false").lower() == "true":
+        from airflow.api_internal.internal_api_call import InternalApiConfig
+
+        InternalApiConfig.set_use_internal_api("tests", allow_tests_to_use_db=True)
+
+
+def skip_if_database_isolation_mode(item):
+    if os.environ.get("RUN_TESTS_WITH_DATABASE_ISOLATION", "false").lower() == "true":
+        for _ in item.iter_markers(name="skip_if_database_isolation_mode"):
+            pytest.skip("This test is skipped because it is not allowed in database isolation mode.")
+
+
+def pytest_addoption(parser: pytest.Parser):
     """Add options parser for custom plugins."""
     group = parser.getgroup("airflow")
     group.addoption(
@@ -230,6 +258,12 @@ def pytest_addoption(parser):
         metavar="INTEGRATIONS",
         help="only run tests matching integration specified: "
         "[cassandra,kerberos,mongo,celery,statsd,trino]. ",
+    )
+    group.addoption(
+        "--keep-env-variables",
+        action="store_true",
+        dest="keep_env_variables",
+        help="do not clear environment variables that might have side effect while running tests",
     )
     group.addoption(
         "--skip-db-tests",
@@ -299,6 +333,12 @@ def pytest_addoption(parser):
         help="Disable DB clear before each test module.",
     )
     group.addoption(
+        "--disable-forbidden-warnings",
+        action="store_true",
+        dest="disable_forbidden_warnings",
+        help="Disable raising an error if forbidden warnings detected.",
+    )
+    group.addoption(
         "--disable-capture-warnings",
         action="store_true",
         dest="disable_capture_warnings",
@@ -315,35 +355,33 @@ def pytest_addoption(parser):
             "then 'warnings.txt' will be used."
         ),
     )
+    parser.addini(
+        name="forbidden_warnings",
+        type="linelist",
+        help="List of internal Airflow warnings which are prohibited during tests execution.",
+    )
 
 
 def initial_db_init():
     from flask import Flask
 
     from airflow.configuration import conf
-    from airflow.exceptions import RemovedInAirflow3Warning
     from airflow.utils import db
     from airflow.www.extensions.init_appbuilder import init_appbuilder
     from airflow.www.extensions.init_auth_manager import get_auth_manager
+    from tests.test_utils.compat import AIRFLOW_V_2_8_PLUS, AIRFLOW_V_2_10_PLUS
 
-    ignore_warnings = {
-        RemovedInAirflow3Warning: [
-            # SubDagOperator warnings
-            "This class is deprecated. Please use `airflow.utils.task_group.TaskGroup`."
-        ]
-    }
-
-    db.resetdb()
-    with warnings.catch_warnings():
-        for warning_category, messages in ignore_warnings.items():
-            for message in messages:
-                warnings.filterwarnings("ignore", message=re.escape(message), category=warning_category)
-        db.bootstrap_dagbag()
+    if AIRFLOW_V_2_10_PLUS:
+        db.resetdb(use_migration_files=True)
+    else:
+        db.resetdb()
+    db.bootstrap_dagbag()
     # minimal app to add roles
     flask_app = Flask(__name__)
     flask_app.config["SQLALCHEMY_DATABASE_URI"] = conf.get("database", "SQL_ALCHEMY_CONN")
     init_appbuilder(flask_app)
-    get_auth_manager().init()
+    if AIRFLOW_V_2_8_PLUS:
+        get_auth_manager().init()
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -427,28 +465,47 @@ def pytest_configure(config: pytest.Config) -> None:
         "external_python_operator: external python operator tests are 'long', we should run them separately",
     )
     config.addinivalue_line("markers", "enable_redact: do not mock redact secret masker")
+    config.addinivalue_line("markers", "skip_if_database_isolation_mode: skip if DB isolation is enabled")
 
     os.environ["_AIRFLOW__SKIP_DATABASE_EXECUTOR_COMPATIBILITY_CHECK"] = "1"
 
-    # Setup capture warnings
+    # Setup internal warnings plugins
     if "ignore" in sys.warnoptions:
+        config.option.disable_forbidden_warnings = True
         config.option.disable_capture_warnings = True
+    if not config.pluginmanager.get_plugin("warnings"):
+        # Internal forbidden warnings plugin depends on builtin pytest warnings plugin
+        config.option.disable_forbidden_warnings = True
+
+    forbidden_warnings: list[str] | None = config.getini("forbidden_warnings")
+    if not config.option.disable_forbidden_warnings and forbidden_warnings:
+        from tests._internals.forbidden_warnings import ForbiddenWarningsPlugin
+
+        forbidden_warnings_plugin = ForbiddenWarningsPlugin(
+            config=config,
+            forbidden_warnings=tuple(map(str.strip, forbidden_warnings)),
+        )
+        config.pluginmanager.register(forbidden_warnings_plugin)
+        config.stash[forbidden_warnings_key] = forbidden_warnings_plugin
+
     if not config.option.disable_capture_warnings:
         from tests._internals.capture_warnings import CaptureWarningsPlugin
 
-        plugin = CaptureWarningsPlugin(
+        capture_warnings_plugin = CaptureWarningsPlugin(
             config=config, output_path=config.getoption("warning_output_path", default=None)
         )
-        config.pluginmanager.register(plugin)
-        config.stash[capture_warnings_key] = plugin
+        config.pluginmanager.register(capture_warnings_plugin)
+        config.stash[capture_warnings_key] = capture_warnings_plugin
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     os.environ.pop("_AIRFLOW__SKIP_DATABASE_EXECUTOR_COMPATIBILITY_CHECK", None)
-    capture_warnings = config.stash.get(capture_warnings_key, None)
-    if capture_warnings:
+    if forbidden_warnings_plugin := config.stash.get(forbidden_warnings_key, None):
+        del config.stash[forbidden_warnings_key]
+        config.pluginmanager.unregister(forbidden_warnings_plugin)
+    if capture_warnings_plugin := config.stash.get(capture_warnings_key, None):
         del config.stash[capture_warnings_key]
-        config.pluginmanager.unregister(capture_warnings)
+        config.pluginmanager.unregister(capture_warnings_plugin)
 
 
 def skip_if_not_marked_with_integration(selected_integrations, item):
@@ -627,34 +684,6 @@ def skip_if_credential_file_missing(item):
             pytest.skip(f"The test requires credential file {credential_path}: {item}")
 
 
-@functools.lru_cache(maxsize=None)
-def deprecations_ignore() -> tuple[str, ...]:
-    with open(Path(__file__).resolve().parent / "deprecations_ignore.yml") as fp:
-        return tuple(yaml.safe_load(fp))
-
-
-def setup_error_warnings(item: pytest.Item):
-    if item.nodeid.startswith(deprecations_ignore()):
-        return
-
-    # We cannot add everything related to the airflow package it into `filterwarnings`
-    # in the pyproject.toml sections, because it invokes airflow import before we setup test environment.
-    # Instead of that, we are dynamically adding as `filterwarnings` marker.
-    prohibited_warnings = (
-        "airflow.exceptions.RemovedInAirflow3Warning",
-        "airflow.utils.context.AirflowContextDeprecationWarning",
-        "airflow.exceptions.AirflowProviderDeprecationWarning",
-    )
-    for w in prohibited_warnings:
-        # Add marker at the beginning of the markers list. In this case, it does not conflict with
-        # filterwarnings markers, which are set explicitly in the test suite.
-        item.add_marker(pytest.mark.filterwarnings(f"error::{w}"), append=False)
-
-
-def pytest_itemcollected(item: pytest.Item):
-    setup_error_warnings(item)
-
-
 def pytest_runtest_setup(item):
     selected_integrations_list = item.config.option.integration
     selected_systems_list = item.config.option.system
@@ -676,6 +705,7 @@ def pytest_runtest_setup(item):
         skip_if_platform_doesnt_match(marker)
     for marker in item.iter_markers(name="backend"):
         skip_if_wrong_backend(marker, item)
+    skip_if_database_isolation_mode(item)
     selected_backend = item.config.option.backend
     if selected_backend:
         skip_if_not_marked_with_backend(selected_backend, item)
@@ -876,6 +906,8 @@ def dag_maker(request):
             self.dag_run = dag.create_dagrun(**kwargs)
             for ti in self.dag_run.task_instances:
                 ti.refresh_from_task(dag.get_task(ti.task_id))
+            if self.want_serialized:
+                self.session.commit()
             return self.dag_run
 
         def create_dagrun_after(self, dagrun, **kwargs):
@@ -1013,10 +1045,14 @@ def create_dummy_dag(dag_maker):
         with_dagrun_type=DagRunType.SCHEDULED,
         **kwargs,
     ):
+        op_kwargs = {}
+        from tests.test_utils.compat import AIRFLOW_V_2_9_PLUS
+
+        if AIRFLOW_V_2_9_PLUS:
+            op_kwargs["task_display_name"] = task_display_name
         with dag_maker(dag_id, **kwargs) as dag:
             op = EmptyOperator(
                 task_id=task_id,
-                task_display_name=task_display_name,
                 max_active_tis_per_dag=max_active_tis_per_dag,
                 max_active_tis_per_dagrun=max_active_tis_per_dagrun,
                 executor_config=executor_config or {},
@@ -1027,6 +1063,7 @@ def create_dummy_dag(dag_maker):
                 email=email,
                 pool=pool,
                 trigger_rule=trigger_rule,
+                **op_kwargs,
             )
         if with_dagrun_type is not None:
             dag_maker.create_dagrun(run_type=with_dagrun_type)
@@ -1178,18 +1215,24 @@ def reset_logging_config():
 def suppress_info_logs_for_dag_and_fab():
     import logging
 
+    from tests.test_utils.compat import AIRFLOW_V_2_9_PLUS
+
     dag_logger = logging.getLogger("airflow.models.dag")
     dag_logger.setLevel(logging.WARNING)
 
-    fab_logger = logging.getLogger("airflow.providers.fab.auth_manager.security_manager.override")
-    fab_logger.setLevel(logging.WARNING)
+    if AIRFLOW_V_2_9_PLUS:
+        fab_logger = logging.getLogger("airflow.providers.fab.auth_manager.security_manager.override")
+        fab_logger.setLevel(logging.WARNING)
+    else:
+        fab_logger = logging.getLogger("airflow.www.fab_security")
+        fab_logger.setLevel(logging.WARNING)
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _clear_db(request):
+    """Clear DB before each test module run."""
     from tests.test_utils.db import clear_all
 
-    """Clear DB before each test module run."""
     if not request.config.option.db_cleanup:
         return
     if skip_db_tests:
@@ -1207,7 +1250,6 @@ def _clear_db(request):
     if dist_option != "no" or hasattr(request.config, "workerinput"):
         # Skip if pytest-xdist detected (controller or worker)
         return
-
     try:
         clear_all()
     except Exception as ex:
@@ -1268,9 +1310,11 @@ def initialize_providers_manager():
 def close_all_sqlalchemy_sessions():
     from sqlalchemy.orm import close_all_sessions
 
-    close_all_sessions()
+    with suppress(Exception):
+        close_all_sessions()
     yield
-    close_all_sessions()
+    with suppress(Exception):
+        close_all_sessions()
 
 
 @pytest.fixture
@@ -1302,6 +1346,30 @@ def _disable_redact(request: pytest.FixtureRequest, mocker):
         mp_ctx.setattr(settings, "MASK_SECRETS_IN_LOGS", False)
         yield
     return
+
+
+@pytest.fixture
+def airflow_root_path() -> Path:
+    import airflow
+
+    return Path(airflow.__path__[0]).parent
+
+
+@pytest.fixture
+def hook_lineage_collector():
+    from airflow.lineage import hook
+
+    hook._hook_lineage_collector = None
+    hook._hook_lineage_collector = hook.HookLineageCollector()
+    yield hook.get_hook_lineage_collector()
+    hook._hook_lineage_collector = None
+
+
+# This constant is set to True if tests are run with Airflow installed from Packages rather than running
+# the tests within Airflow sources. While most tests in CI are run using Airflow sources, there are
+# also compatibility tests that only use `tests` package and run against installed packages of Airflow in
+# for supported Airflow versions.
+RUNNING_TESTS_AGAINST_AIRFLOW_PACKAGES = not (Path(__file__).parents[1] / "airflow" / "__init__.py").exists()
 
 
 if TYPE_CHECKING:
